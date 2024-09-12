@@ -1,0 +1,170 @@
+# @title
+import pandas as pd
+import gspread
+from google.auth import default
+from google.colab import auth
+import ipywidgets as widgets
+from IPython.display import display
+import os
+from datetime import datetime
+
+# Configuração do Google Drive
+from google.colab import drive
+drive.mount('/content/drive')
+
+# Função para ler o último número gerado do arquivo
+def read_last_code():
+    try:
+        with open('/content/drive/My Drive/PRM/ultimo_codigo.txt', 'r') as file:
+            last_code = file.read().strip()
+            return int(last_code) if last_code else 0
+    except FileNotFoundError:
+        return 0
+
+# Função para atualizar o último número gerado no arquivo
+def write_last_code(last_code):
+    with open('/content/drive/My Drive/PRM/ultimo_codigo.txt', 'w') as file:
+        file.write(str(last_code))
+
+# Função para registrar trocas e cancelamentos em arquivos CSV
+def log_event(event_type, cupom, produto, quantidade, pontos_necessarios, saldo_final, codigo_gerado=None):
+    log_file = '/content/drive/My Drive/PRM/trocas_e_cancelamentos.csv'
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    # Verificar se o arquivo existe e criar o cabeçalho se não existir
+    if not os.path.isfile(log_file):
+        with open(log_file, 'w') as file:
+            file.write('Timestamp,Tipo de Evento,Cupom,Produto,Quantidade,Pontos Necessários,Saldo Final,Código Gerado\n')
+
+    with open(log_file, 'a') as file:
+        file.write(f'{timestamp},{event_type},{cupom},{produto},{quantidade},{pontos_necessarios},{saldo_final},{codigo_gerado}\n')
+
+# Autenticar e autorizar acesso ao Google Sheets
+auth.authenticate_user()
+creds, _ = default()
+gc = gspread.authorize(creds)
+
+# Carregar a planilha
+sheet_url = 'https://docs.google.com/spreadsheets/d/1bPJrIQB7ICMOxGzjaoXv53jjKUkpwfVBDyJ7yjURbyU/edit?gid=1607251331'
+spreadsheet = gc.open_by_url(sheet_url)
+
+# Carregar as abas
+worksheet_medicos = spreadsheet.worksheet('Pontos_Médicos')
+worksheet_produtos = spreadsheet.worksheet('Pontos_Produtos')
+
+df_medicos = pd.DataFrame(worksheet_medicos.get_all_records())
+df_produtos = pd.DataFrame(worksheet_produtos.get_all_records())
+
+# Corrigir a coluna para Esmeralda
+df_medicos['Esmeralda'] = df_medicos['Esmeralda'].apply(lambda x: str(x).strip().upper() == 'SIM')
+
+# Criar widgets para entradas do usuário
+input_cupom = widgets.Text(description='Cupom:')
+input_produto = widgets.Dropdown(
+    description='Produto:',
+    options=df_produtos['Produto por ordem alfabética'].tolist()  # Ajuste conforme o nome da coluna
+)
+input_quantidade = widgets.IntSlider(description='Quantidade:', min=1, max=10, step=1, value=1)
+button_calcular = widgets.Button(description='Calcular')
+
+# Exibir widgets
+display(input_cupom, input_produto, input_quantidade, button_calcular)
+
+def calcular_pontuacao(b):
+    cupom = input_cupom.value
+    produto = input_produto.value
+    quantidade = input_quantidade.value
+
+    # Verificar pontos do cupom
+    if cupom in df_medicos['Cupom_Médico'].values:
+        medico_info = df_medicos[df_medicos['Cupom_Médico'] == cupom].iloc[0]
+        pontos_atual = medico_info['Saldo Atual']
+        esmeralda = medico_info['Esmeralda']
+        esmeralda_status = "SIM" if esmeralda else "NÃO"
+    else:
+        print("Cupom não encontrado!")
+        return
+
+    # Verificar pontos necessários para o produto
+    if produto in df_produtos['Produto por ordem alfabética'].values:
+        produto_info = df_produtos[df_produtos['Produto por ordem alfabética'] == produto].iloc[0]
+        pontos_unitario = produto_info['Nova Tabela']
+        pontos_necessarios = pontos_unitario * quantidade
+    else:
+        print("Produto não encontrado!")
+        return
+
+    # Calcular o percentual da troca
+    percentual_troca = (pontos_atual / pontos_necessarios) * 100 if pontos_necessarios != 0 else 0
+
+    # Mostrar resultados
+    print(f"Pontos disponíveis: {pontos_atual}")
+    print(f"Pontos necessários: {pontos_necessarios}")
+    print(f"Percentual da troca: {percentual_troca:.2f}%")
+    print(f"O cupom é Esmeralda: {esmeralda_status}")
+
+    # Botão para aceitar a troca
+    button_aceitar = widgets.Button(description='Aceitar Troca')
+    display(button_aceitar)
+
+    # Botão para cancelar a troca
+    button_cancelar = widgets.Button(description='Cancelar Troca')
+    display(button_cancelar)
+
+    def aceitar_troca(b):
+        nonlocal pontos_atual
+        last_code = read_last_code()
+        new_code_number = last_code + 1
+        new_code = f"PRMC{new_code_number:08d}"
+        write_last_code(new_code_number)
+
+        if esmeralda:
+            if percentual_troca < 100:
+                saldo_final = 0
+            else:
+                saldo_final = pontos_atual - pontos_necessarios
+        else:
+            saldo_final = pontos_atual - pontos_necessarios
+
+        print(f"Troca aceita! Código gerado: {new_code}")
+        print(f"Nova pontuação do cupom: {saldo_final}")
+
+        try:
+            # Atualizar a planilha
+            cell_row = df_medicos.index[df_medicos['Cupom_Médico'] == cupom][0] + 2  # +2 para compensar o cabeçalho
+            worksheet_medicos.update_cell(cell_row, df_medicos.columns.get_loc('Saldo Atual') + 1, int(saldo_final))
+
+            # Registrar a troca
+            log_event('Troca', cupom, produto, quantidade, pontos_necessarios, saldo_final, codigo_gerado=new_code)
+        except Exception as e:
+            print(f"Erro ao atualizar a planilha: {e}")
+
+    def cancelar_troca(b):
+        nonlocal pontos_atual
+        try:
+            # Restaurar pontos na planilha
+            if esmeralda:
+                saldo_atualizado = pontos_atual + int(pontos_necessarios)
+            else:
+                saldo_atualizado = pontos_atual + int(pontos_necessarios)
+
+            saldo_atualizado = int(saldo_atualizado)
+            cell_row = df_medicos.index[df_medicos['Cupom_Médico'] == cupom][0] + 2  # +2 para compensar o cabeçalho
+            worksheet_medicos.update_cell(cell_row, df_medicos.columns.get_loc('Saldo Atual') + 1, saldo_atualizado)
+
+            # Atualizar o DataFrame local para refletir as mudanças
+            df_medicos.loc[df_medicos['Cupom_Médico'] == cupom, 'Saldo Atual'] = saldo_atualizado
+
+            # Mostrar a pontuação restaurada
+            print("Troca cancelada! Pontuação restaurada.")
+            print(f"Pontuação atual do cupom: {saldo_atualizado}")
+
+            # Registrar o cancelamento
+            log_event('Cancelamento', cupom, produto, quantidade, pontos_necessarios, saldo_atualizado)
+        except Exception as e:
+            print(f"Erro ao cancelar a troca: {e}")
+
+    button_aceitar.on_click(aceitar_troca)
+    button_cancelar.on_click(cancelar_troca)
+
+button_calcular.on_click(calcular_pontuacao)
